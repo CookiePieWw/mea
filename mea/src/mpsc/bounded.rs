@@ -25,10 +25,10 @@ use std::task::Poll;
 use std::task::Waker;
 
 use crate::atomicbox::AtomicOptionBox;
+use crate::internal::Semaphore;
 use crate::mpsc::error::TrySendError;
 use crate::mpsc::SendError;
 use crate::mpsc::TryRecvError;
-use crate::semaphore::Semaphore;
 
 /// Creates a bounded mpsc channel for communicating between asynchronous
 /// tasks with backpressure.
@@ -115,12 +115,17 @@ impl<T> BoundedSender<T> {
     /// If the receiver has been dropped, this function returns an error. The error includes
     /// the value passed to `send`.
     pub async fn send(&self, value: T) -> Result<(), SendError<T>> {
-        let permit = self.state.tx_permits.acquire(1).await;
+        self.state.tx_permits.acquire(1).await;
 
         // SAFETY: The sender is guaranteed to be non-null before dropped.
         let sender = self.sender.as_ref().unwrap();
-        sender.send(value).map_err(|err| SendError::new(err.0))?;
-        permit.forget();
+        match sender.send(value) {
+            Ok(()) => {}
+            Err(err) => {
+                self.state.tx_permits.release(1);
+                return Err(SendError::new(err.0));
+            }
+        }
 
         if let Some(waker) = self.state.rx_task.take(Ordering::Acquire) {
             waker.wake();
@@ -157,17 +162,20 @@ impl<T> BoundedSender<T> {
     /// # }
     /// ```
     pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
-        let permit = match self.state.tx_permits.try_acquire(1) {
-            Some(permit) => permit,
-            None => return Err(TrySendError::new_full(value)),
+        match self.state.tx_permits.try_acquire(1) {
+            true => {}
+            false => return Err(TrySendError::new_full(value)),
         };
 
         // SAFETY: The sender is guaranteed to be non-null before dropped.
         let sender = self.sender.as_ref().unwrap();
-        sender
-            .send(value)
-            .map_err(|err| TrySendError::new_disconnected(err.0))?;
-        permit.forget();
+        match sender.send(value) {
+            Ok(()) => {}
+            Err(err) => {
+                self.state.tx_permits.release(1);
+                return Err(TrySendError::new_disconnected(err.0));
+            }
+        }
 
         if let Some(waker) = self.state.rx_task.take(Ordering::Acquire) {
             waker.wake();
@@ -198,7 +206,7 @@ impl<T> fmt::Debug for BoundedReceiver<T> {
 impl<T> Drop for BoundedReceiver<T> {
     fn drop(&mut self) {
         drop(self.receiver.take());
-        self.state.tx_permits.release(u32::MAX as usize);
+        self.state.tx_permits.notify_all();
     }
 }
 

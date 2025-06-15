@@ -253,3 +253,12 @@ fn test_bounded_pressure() {
         println!("Elapsed: {:?}", start.elapsed());
     });
 }
+
+#[tokio::test]
+async fn main() {
+    let (tx, rx) = mpsc::bounded::<i32>(1);
+    tx.try_send(1).unwrap();
+    assert_eq!(tx.try_send(2), Err(TrySendError::Full(2)));
+    drop(rx);
+    assert_eq!(tx.try_send(3), Err(TrySendError::Disconnected(3)));
+}
